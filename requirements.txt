@@ -1,0 +1,7 @@
+torch>=2.0.0
+torchvision>=0.15.0
+timm>=0.9.0            # For DeiT baseline comparison
+einops>=0.7.0          # Einstein operations for clarity
+tqdm>=4.65.0
+matplotlib>=3.7.0
+tensorboard>=2.13.0

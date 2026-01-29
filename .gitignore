@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Data & outputs
+data/cifar-100-python/
+data/tiny-imagenet-200/
+checkpoints/
+runs/
+*.pth
+*.pt
+
+# IDE / OS
+.idea/
+.DS_Store

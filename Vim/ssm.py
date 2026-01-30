@@ -125,22 +125,24 @@ class SelectiveSSM(nn.Module):
         Returns:
             y: (B, L, D)
         """
-        bsz, seq_len, d_model = x.shape
+        bsz, seq_len_in, d_model = x.shape
         assert d_model == self.d_model
 
         # Local convolution over sequence (B, D, L) -> (B, D, L) -> (B, L, D)
+        # Conv1d can change length: e.g. kernel_size=4, padding=2 gives L+1
         x_conv = x.transpose(1, 2)  # (B, D, L)
         x_conv = self.conv(x_conv)
-        x_conv = x_conv.transpose(1, 2)  # (B, L, D)
+        x_conv = x_conv.transpose(1, 2)  # (B, L_conv, D)
+        seq_len_conv = x_conv.size(1)
 
         # Project to Δ, B, C parameters.
-        proj = self.in_proj(x_conv)  # (B, L, 2 * inner_dim + d_state)
+        proj = self.in_proj(x_conv)  # (B, L_conv, 2 * inner_dim + d_state)
         inner_dim = self.config.expand * self.d_state
         delta, B_in, C = torch.split(proj, [self.d_state, inner_dim, inner_dim], dim=-1)
 
         # Reduce inner_dim to d_state for B and C via reshaping + mean pooling.
-        B_in = B_in.view(bsz, seq_len, self.d_state, -1).mean(dim=-1)  # (B, L, d_state)
-        C = C.view(bsz, seq_len, self.d_state, -1).mean(dim=-1)  # (B, L, d_state)
+        B_in = B_in.view(bsz, seq_len_conv, self.d_state, -1).mean(dim=-1)  # (B, L_conv, d_state)
+        C = C.view(bsz, seq_len_conv, self.d_state, -1).mean(dim=-1)  # (B, L_conv, d_state)
 
         A_bar, B_bar_scale = self._discretize(delta)  # (B, L, d_state)
         B_bar = B_bar_scale * B_in  # (B, L, d_state)
@@ -149,12 +151,13 @@ class SelectiveSSM(nn.Module):
         scan_fn = parallel_scan if self.config.use_parallel_scan else naive_scan
         h = scan_fn(A_bar, B_bar)  # (B, L, d_state)
 
-        # Output y_t = C_t · h_t (element-wise then sum over state).
-        y_state = C * h  # (B, L, d_state)
-        y_reduced = y_state.sum(dim=-1)  # (B, L)
+        # Output y_t = C_t · h_t (element-wise); project state to model dim.
+        y_state = C * h  # (B, L_conv, d_state)
+        y = self.out_proj(y_state)  # (B, L_conv, d_model)
 
-        # Project back to model dimension.
-        y = self.out_proj(y_reduced.unsqueeze(-1).expand(-1, -1, self.d_state).mean(dim=-1))
+        # Ensure output length matches input (conv may have changed it).
+        if y.size(1) != seq_len_in:
+            y = y[:, :seq_len_in].contiguous()
         return y
 
 

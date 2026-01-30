@@ -19,6 +19,7 @@ class CIFAR100Config:
     batch_size: int = 128
     num_workers: int = 4
     pin_memory: bool = True
+    persistent_workers: bool = True
 
 
 def _build_transforms(img_size: int, train: bool) -> transforms.Compose:
@@ -51,6 +52,7 @@ def build_cifar100_dataloaders(
     batch_size: int = 128,
     num_workers: int = 4,
     pin_memory: bool = True,
+    persistent_workers: bool = True,
 ) -> Tuple[DataLoader, DataLoader]:
     """
     Create CIFAR-100 train and test dataloaders.
@@ -61,6 +63,7 @@ def build_cifar100_dataloaders(
         batch_size=batch_size,
         num_workers=num_workers,
         pin_memory=pin_memory,
+        persistent_workers=persistent_workers and num_workers > 0,
     )
 
     train_transform = _build_transforms(cfg.img_size, train=True)
@@ -85,6 +88,7 @@ def build_cifar100_dataloaders(
         shuffle=True,
         num_workers=cfg.num_workers,
         pin_memory=cfg.pin_memory,
+        persistent_workers=cfg.persistent_workers,
     )
     test_loader = DataLoader(
         test_dataset,
@@ -92,6 +96,7 @@ def build_cifar100_dataloaders(
         shuffle=False,
         num_workers=cfg.num_workers,
         pin_memory=cfg.pin_memory,
+        persistent_workers=cfg.persistent_workers,
     )
     return train_loader, test_loader
 

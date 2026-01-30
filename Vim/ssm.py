@@ -148,10 +148,11 @@ class SelectiveSSM(nn.Module):
         delta, B_in, C = torch.split(proj, [self.d_state, inner_dim, inner_dim], dim=-1)
 
         # Reduce inner_dim to d_state for B and C via reshaping + mean pooling.
-        # Use actual sequence length from tensors (conv can change length; 2080 = 1*65*32)
+        # CRITICAL: use B_in's actual seq length (conv may change length: 64->65 or 64->63).
         L = B_in.size(1)
-        B_in = B_in.view(bsz, L, self.d_state, -1).mean(dim=-1)  # (B, L, d_state)
-        C = C.view(bsz, L, self.d_state, -1).mean(dim=-1)  # (B, L, d_state)
+        inner = B_in.size(2)  # inner_dim
+        B_in = B_in.view(bsz, L, self.d_state, inner // self.d_state).mean(dim=-1)  # (B, L, d_state)
+        C = C.view(bsz, L, self.d_state, inner // self.d_state).mean(dim=-1)  # (B, L, d_state)
 
         A_bar, B_bar_scale = self._discretize(delta)  # (B, L, d_state)
         B_bar = B_bar_scale * B_in  # (B, L, d_state)

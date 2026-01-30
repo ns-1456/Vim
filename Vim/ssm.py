@@ -54,11 +54,13 @@ class SelectiveSSM(nn.Module):
         self.d_state = d_state
 
         # Depthwise convolution over sequence (local mixing).
+        # Use padding so output length equals input length (kernel_size=4 -> padding=1).
+        self.conv_pad = (d_conv - 1) // 2  # 1 for d_conv=4 -> out_len = in_len
         self.conv = nn.Conv1d(
             d_model,
             d_model,
             kernel_size=d_conv,
-            padding=d_conv // 2,
+            padding=self.conv_pad,
             groups=d_model,
         )
 
@@ -129,20 +131,27 @@ class SelectiveSSM(nn.Module):
         assert d_model == self.d_model
 
         # Local convolution over sequence (B, D, L) -> (B, D, L) -> (B, L, D)
-        # Conv1d can change length: e.g. kernel_size=4, padding=2 gives L+1
+        # padding=(d_conv-1)//2: k=4 gives pad=1 -> out_len = L-1; pad back to L
         x_conv = x.transpose(1, 2)  # (B, D, L)
-        x_conv = self.conv(x_conv)
-        x_conv = x_conv.transpose(1, 2)  # (B, L_conv, D)
-        seq_len_conv = x_conv.size(1)
+        x_conv = self.conv(x_conv)  # (B, D, L_out), L_out may be L-1 or L+1
+        if x_conv.size(2) != seq_len_in:
+            pad_len = seq_len_in - x_conv.size(2)
+            if pad_len > 0:
+                x_conv = F.pad(x_conv, (0, pad_len), mode="constant", value=0.0)
+            else:
+                x_conv = x_conv[:, :, :seq_len_in]
+        x_conv = x_conv.transpose(1, 2)  # (B, L, D)
 
         # Project to Δ, B, C parameters.
-        proj = self.in_proj(x_conv)  # (B, L_conv, 2 * inner_dim + d_state)
+        proj = self.in_proj(x_conv)  # (B, L, 2*inner_dim + d_state)
         inner_dim = self.config.expand * self.d_state
         delta, B_in, C = torch.split(proj, [self.d_state, inner_dim, inner_dim], dim=-1)
 
         # Reduce inner_dim to d_state for B and C via reshaping + mean pooling.
-        B_in = B_in.view(bsz, seq_len_conv, self.d_state, -1).mean(dim=-1)  # (B, L_conv, d_state)
-        C = C.view(bsz, seq_len_conv, self.d_state, -1).mean(dim=-1)  # (B, L_conv, d_state)
+        # Use actual sequence length from tensors (conv can change length; 2080 = 1*65*32)
+        L = B_in.size(1)
+        B_in = B_in.view(bsz, L, self.d_state, -1).mean(dim=-1)  # (B, L, d_state)
+        C = C.view(bsz, L, self.d_state, -1).mean(dim=-1)  # (B, L, d_state)
 
         A_bar, B_bar_scale = self._discretize(delta)  # (B, L, d_state)
         B_bar = B_bar_scale * B_in  # (B, L, d_state)
@@ -152,10 +161,9 @@ class SelectiveSSM(nn.Module):
         h = scan_fn(A_bar, B_bar)  # (B, L, d_state)
 
         # Output y_t = C_t · h_t (element-wise); project state to model dim.
-        y_state = C * h  # (B, L_conv, d_state)
-        y = self.out_proj(y_state)  # (B, L_conv, d_model)
-
-        # Ensure output length matches input (conv may have changed it).
+        y_state = C * h  # (B, L, d_state)
+        y = self.out_proj(y_state)  # (B, L, d_model)
+        # Return same length as input (L may differ if conv changed length before pad/slice).
         if y.size(1) != seq_len_in:
             y = y[:, :seq_len_in].contiguous()
         return y

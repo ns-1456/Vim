@@ -101,23 +101,36 @@ class SelectiveSSM(nn.Module):
         # Conv on (B, D, L)
         x_conv = x.transpose(1, 2)
         x_conv = self.conv(x_conv)
-        # Force length L_in (conv can give L_in-1 or L_in+1)
+        
+        # Logic to handle Conv1d output length mismatches
+        # This ensures x_conv is exactly L_in length before proceeding
         if x_conv.size(2) != L_in:
             if x_conv.size(2) < L_in:
                 x_conv = F.pad(x_conv, (0, L_in - x_conv.size(2)), mode="constant", value=0.0)
             else:
                 x_conv = x_conv[:, :, :L_in]
+        
         x_conv = x_conv.transpose(1, 2)
         # x_conv: (B, L_in, D)
 
         inner_dim = self.config.expand * self.d_state
         proj = self.in_proj(x_conv)
+        
+        # --- FIX ADDED HERE ---
+        # Explicitly truncate proj to match L_in. 
+        # This acts as a safety net if the conv logic above drifted or if x_conv shape changed.
+        if proj.shape[1] != L_in:
+            proj = proj[:, :L_in, :]
+        # ----------------------
+
         delta = proj[..., : self.d_state]
         B_in = proj[..., self.d_state : self.d_state + inner_dim]
         C = proj[..., self.d_state + inner_dim :]
 
         # B_in, C: (B, L_in, inner_dim) -> (B, L_in, d_state) by (L_in, d_state, 2) mean
         n_groups = inner_dim // self.d_state
+        
+        # Now this reshape will work because B_in size is guaranteed to be bsz * L_in * inner_dim
         B_in = B_in.reshape(bsz, L_in, self.d_state, n_groups).mean(dim=-1)
         C = C.reshape(bsz, L_in, self.d_state, n_groups).mean(dim=-1)
 

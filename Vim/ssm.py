@@ -1,3 +1,7 @@
+"""
+Selective State Space Model (SSM) block.
+Sequence length is normalized after conv so all tensors stay (B, L, *) with L = input length.
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -24,13 +28,9 @@ class SelectiveSSMConfig:
 class SelectiveSSM(nn.Module):
     """
     Selective State Space Model with input-dependent parameters.
-
-    Architecture:
-      1. Local depthwise Conv1D over sequence
-      2. Project input to (Δ, B, C) via linear layers
-      3. ZOH discretization: Ā = exp(Δ·A), B̄ = ...
-      4. Run scan over recurrence h_t = Ā_t * h_{t-1} + B̄_t
-      5. Compute output y_t = C_t · h_t
+    1. Depthwise Conv1D (length normalized to input L)
+    2. Project to (Δ, B, C) -> reshape B,C to d_state
+    3. ZOH discretize -> scan -> output
     """
 
     def __init__(
@@ -49,27 +49,19 @@ class SelectiveSSM(nn.Module):
             expand=expand,
             use_parallel_scan=use_parallel_scan,
         )
-
         self.d_model = d_model
         self.d_state = d_state
+        inner_dim = expand * d_state
 
-        # Depthwise convolution over sequence (local mixing).
-        # Use padding so output length equals input length (kernel_size=4 -> padding=1).
-        self.conv_pad = (d_conv - 1) // 2  # 1 for d_conv=4 -> out_len = in_len
         self.conv = nn.Conv1d(
             d_model,
             d_model,
             kernel_size=d_conv,
-            padding=self.conv_pad,
+            padding=(d_conv - 1) // 2,
             groups=d_model,
         )
-
-        # Project to Δ, B, C.
-        inner_dim = expand * d_state
-        self.in_proj = nn.Linear(d_model, 2 * inner_dim + d_state)
+        self.in_proj = nn.Linear(d_model, d_state + 2 * inner_dim)
         self.out_proj = nn.Linear(d_state, d_model)
-
-        # Diagonal SSM parameter A (log-parameterized for stability).
         self.A_log = nn.Parameter(torch.zeros(d_state))
 
         self._init_weights()
@@ -78,97 +70,66 @@ class SelectiveSSM(nn.Module):
         nn.init.kaiming_uniform_(self.conv.weight, a=math.sqrt(5))
         if self.conv.bias is not None:
             nn.init.zeros_(self.conv.bias)
-
         nn.init.xavier_uniform_(self.in_proj.weight)
         nn.init.zeros_(self.in_proj.bias)
-
         nn.init.xavier_uniform_(self.out_proj.weight)
         nn.init.zeros_(self.out_proj.bias)
 
-    def _discretize(self, delta: Tensor) -> Tensor:
-        """
-        ZOH discretization for diagonal A.
-
-        Args:
-            delta: (B, L, d_state)
-        Returns:
-            A_bar: (B, L, d_state)
-            B_bar_scale: (B, L, d_state) such that B̄ = B_bar_scale * B
-        """
-        # Ensure A has negative real parts for stability.
-        A = -torch.exp(self.A_log)  # (d_state,)
-        A = A.view(1, 1, -1)  # (1, 1, d_state)
-
-        # delta >= 0
+    def _discretize(self, delta: Tensor) -> tuple[Tensor, Tensor]:
+        """ZOH: A_bar, B_bar_scale from delta (B, L, d_state)."""
+        A = -torch.exp(self.A_log).view(1, 1, -1)
         delta = F.softplus(delta)
-        dA = delta * A  # (B, L, d_state)
-
+        dA = delta * A
         A_bar = torch.exp(dA)
-
-        # (exp(Δ·A) - 1) / A
-        # Use a numerically stable formulation around A ≈ 0.
         eps = 1e-4
         A_safe = torch.where(A.abs() < eps, eps * torch.sign(A) + eps, A)
         B_bar_scale = (A_bar - 1.0) / A_safe
-
-        # For very small |A|, use Taylor expansion (exp(x)-1)/x ≈ 1 + x/2 + x^2/6
         small = A.abs() < eps
         if small.any():
             x = dA[small]
             taylor = 1.0 + x / 2.0 + x * x / 6.0
             B_bar_scale = torch.where(small, taylor, B_bar_scale)
-
         return A_bar, B_bar_scale
 
     def forward(self, x: Tensor) -> Tensor:
         """
-        Args:
-            x: (B, L, D)
-        Returns:
-            y: (B, L, D)
+        x: (B, L, D) -> y: (B, L, D)
         """
-        bsz, seq_len_in, d_model = x.shape
+        bsz, L_in, d_model = x.shape
         assert d_model == self.d_model
 
-        # Local convolution over sequence (B, D, L) -> (B, D, L) -> (B, L, D)
-        # padding=(d_conv-1)//2: k=4 gives pad=1 -> out_len = L-1; pad back to L
-        x_conv = x.transpose(1, 2)  # (B, D, L)
-        x_conv = self.conv(x_conv)  # (B, D, L_out), L_out may be L-1 or L+1
-        if x_conv.size(2) != seq_len_in:
-            pad_len = seq_len_in - x_conv.size(2)
-            if pad_len > 0:
-                x_conv = F.pad(x_conv, (0, pad_len), mode="constant", value=0.0)
+        # Conv on (B, D, L)
+        x_conv = x.transpose(1, 2)
+        x_conv = self.conv(x_conv)
+        # Force length L_in (conv can give L_in-1 or L_in+1)
+        if x_conv.size(2) != L_in:
+            if x_conv.size(2) < L_in:
+                x_conv = F.pad(x_conv, (0, L_in - x_conv.size(2)), mode="constant", value=0.0)
             else:
-                x_conv = x_conv[:, :, :seq_len_in]
-        x_conv = x_conv.transpose(1, 2)  # (B, L, D)
+                x_conv = x_conv[:, :, :L_in]
+        x_conv = x_conv.transpose(1, 2)
+        # x_conv: (B, L_in, D)
 
-        # Project to Δ, B, C parameters.
-        proj = self.in_proj(x_conv)  # (B, L, 2*inner_dim + d_state)
         inner_dim = self.config.expand * self.d_state
-        delta, B_in, C = torch.split(proj, [self.d_state, inner_dim, inner_dim], dim=-1)
+        proj = self.in_proj(x_conv)
+        delta = proj[..., : self.d_state]
+        B_in = proj[..., self.d_state : self.d_state + inner_dim]
+        C = proj[..., self.d_state + inner_dim :]
 
-        # Reduce inner_dim to d_state for B and C via reshaping + mean pooling.
-        # CRITICAL: use B_in's actual seq length (conv may change length: 64->65 or 64->63).
-        L = B_in.size(1)
-        inner = B_in.size(2)  # inner_dim
-        B_in = B_in.view(bsz, L, self.d_state, inner // self.d_state).mean(dim=-1)  # (B, L, d_state)
-        C = C.view(bsz, L, self.d_state, inner // self.d_state).mean(dim=-1)  # (B, L, d_state)
+        # B_in, C: (B, L_in, inner_dim) -> (B, L_in, d_state) by (L_in, d_state, 2) mean
+        n_groups = inner_dim // self.d_state
+        B_in = B_in.reshape(bsz, L_in, self.d_state, n_groups).mean(dim=-1)
+        C = C.reshape(bsz, L_in, self.d_state, n_groups).mean(dim=-1)
 
-        A_bar, B_bar_scale = self._discretize(delta)  # (B, L, d_state)
-        B_bar = B_bar_scale * B_in  # (B, L, d_state)
+        A_bar, B_bar_scale = self._discretize(delta)
+        B_bar = B_bar_scale * B_in
 
-        # Run scan over state dimension.
         scan_fn = parallel_scan if self.config.use_parallel_scan else naive_scan
-        h = scan_fn(A_bar, B_bar)  # (B, L, d_state)
+        h = scan_fn(A_bar, B_bar)
 
-        # Output y_t = C_t · h_t (element-wise); project state to model dim.
-        y_state = C * h  # (B, L, d_state)
-        y = self.out_proj(y_state)  # (B, L, d_model)
-        # Return same length as input (L may differ if conv changed length before pad/slice).
-        if y.size(1) != seq_len_in:
-            y = y[:, :seq_len_in].contiguous()
+        y_state = C * h
+        y = self.out_proj(y_state)
         return y
 
 
 __all__ = ["SelectiveSSM", "SelectiveSSMConfig"]
-
